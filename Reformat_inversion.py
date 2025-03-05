@@ -2,71 +2,62 @@ import pandas as pd
 import re
 from openpyxl import load_workbook
 
-##############################################################################
+###############################################################################
 # USER PARAMETERS
-##############################################################################
-filename = "inversion.xlsx"        # the input Excel file
+###############################################################################
+filename = "inversion.xlsx"
 output_filename = "inversion_reformatted.xlsx"
 
-# The three known line items for level 1 (case-insensitive):
-level1_map = {
-    "NUEVAS": "N_",         # e.g. "Nuevas inversiones"
-    "REINVERS": "V_",       # e.g. "Reinversión de utilidades"
-    "CUENTAS": "C_"         # e.g. "Cuentas entre compañías"
-}
+###############################################################################
+# STEP A) Identify level 0 vs. level 1 from the first column text
+#
+# We'll do this by text matching: if the text (case-insensitive) contains
+# "Nuevas", "Reinvers", or "Cuentas", it's level=1 => one of the 3 known lines.
+# Otherwise, it's level=0 => treat as a country.
+###############################################################################
+def is_level1_item(cat_text: str) -> bool:
+    """Return True if cat_text (uppercase) contains Nuestras/Reinvers/Cuentas."""
+    cat_up = cat_text.upper()
+    if "NUEVAS" in cat_up or "REINVERS" in cat_up or "CUENTAS" in cat_up:
+        return True
+    return False
 
-##############################################################################
-# STEP 1: We no longer use bold to detect level 0.
-#         We simply read the first column's text and see if it matches
-#         one of the 3 known items => level 1, else => level 0
-##############################################################################
 wb = load_workbook(filename, data_only=True)
-ws = wb.active
+ws = wb.active  # single sheet
 
 rows_list = []
 for row_cells in ws.iter_rows(min_row=3, max_col=1):
     cell = row_cells[0]
-    cat_text = str(cell.value).strip() if cell.value else ""
-    cat_up = cat_text.upper()
-
-    level = 0  # default
-    # If cat_up contains one of the known items => level=1
-    # e.g. if "NUEVAS" in cat_up => level=1, prefix=N_
-    # But we won't pick prefix now, just do level=1
-    if any(kword in cat_up for kword in level1_map.keys()):
-        level = 1
-    
+    text = str(cell.value).strip() if cell.value else ""
+    lvl = 1 if is_level1_item(text) else 0
     rows_list.append({
         "excel_row": cell.row,
-        "category": cat_text,
-        "level": level
+        "category": text,
+        "level": lvl
     })
 
-print(f"Openpyxl read {len(rows_list)} data rows starting row 3.")
+print(f"Openpyxl read {len(rows_list)} data rows from row 3 onward.")
 
-##############################################################################
-# STEP 2: Read the same file with pandas, using header=[0,1] for 2 header rows
-##############################################################################
+###############################################################################
+# STEP B) Read data with pandas, 2 header rows => MultiIndex => flatten them
+###############################################################################
 df = pd.read_excel(filename, header=[0,1])
 df.reset_index(drop=True, inplace=True)
-
 print(f"Pandas read {len(df)} data rows total.")
 
-# If mismatch => trim
+# If mismatch => trim the longer
 min_len = min(len(df), len(rows_list))
-if len(df)!=len(rows_list):
-    print(f"Warning: pandas has {len(df)} rows, openpyxl has {len(rows_list)} rows. Trunc => {min_len}.")
-df = df.iloc[:min_len].copy()
-rows_list = rows_list[:min_len]
+if min_len < len(df):
+    df = df.iloc[:min_len].copy()
+if min_len < len(rows_list):
+    rows_list = rows_list[:min_len]
 
-##############################################################################
-# STEP 3: Flatten the MultiIndex columns => e.g. "1999Q1" or "1999"
-##############################################################################
+###############################################################################
+# Flatten columns => e.g. (1999,'1') => '1999Q1', (1999,'Total') => '1999'
+###############################################################################
 def flatten_col(col_pair):
-    """
-    (year, season) => e.g. ('1999','1') => '1999Q1'
-    ('1999','Total') => '1999'
-    """
+    # col_pair might be ('1999','1') => '1999Q1'
+    # or ('1999','Total') => '1999'
     year_str = str(col_pair[0]).strip()
     season_str = str(col_pair[1]).strip() if len(col_pair)>1 else ""
     if re.search(r'(?i)total', season_str):
@@ -75,95 +66,116 @@ def flatten_col(col_pair):
         s_int = int(float(season_str))
         return f"{year_str}Q{s_int}"
     except:
-        if season_str:
-            return f"{year_str}{season_str}"
-        else:
-            return year_str
+        return f"{year_str}{season_str}" if season_str else year_str
 
-orig_cols = df.columns.tolist()
+orig_cols = df.columns
 new_cols = []
 for i, cpair in enumerate(orig_cols):
-    if i == 0:
-        new_cols.append("TO_DROP")  # presumably old Category col
+    if i==0:
+        # this might be the old Category col, we skip or rename it
+        new_cols.append("TO_DROP")
     else:
         new_cols.append(flatten_col(cpair))
-
 df.columns = new_cols
 df.drop(columns=["TO_DROP"], inplace=True, errors="ignore")
 
-##############################################################################
-# STEP 4: We expect blocks of 4 rows: 1 level0 (country) + next 3 level1 (N, V, C).
-##############################################################################
+###############################################################################
+# STEP C) Group data by scanning rows_list:
+#   When we see a level=0 => new country block.
+#   Then subsequent level=1 => gather data lines (N_/V_/C_), until next level=0 or end.
+###############################################################################
+# We'll produce final columns => [ "Country", "N_...", "V_...", "C_..." ]
+prefix_map = {
+    "NUEVAS": "N_",           # lines containing "NUEVAS" => prefix "N_"
+    "REINVERS": "V_",         # lines containing "REINVERS" => "V_"
+    "CUENTAS": "C_"           # lines containing "CUENTAS" => "C_"
+}
+
 final_records = []
-i = 0
 nrows = len(df)
-
-while i<nrows:
-    # row i => must be level=0 => country
-    if rows_list[i]["level"]!=0:
-        print(f"Warning: row {i} not level0 => skipping one row.")
-        i +=1
+i = 0
+while i < nrows:
+    # We expect rows_list[i] => level=0 => new country
+    if rows_list[i]["level"] != 0:
+        # skip lines that are level1 if we haven't found a new country yet
+        print(f"Row {i} is level=1 => not a new country => skip 1 row.")
+        i+=1
         continue
+
     country_name = rows_list[i]["category"]
-    
-    # next 3 => level1 => N, V, C
-    if i+3>=nrows:
-        print("End of file => partial block => skip.")
-        break
-    
-    # We'll store numeric data in e.g. block_data["N_"][colName] = value
-    # so we can combine them
-    block_data = {"N_":{}, "V_":{}, "C_":{}}
-    valid_block = True
+    # We'll gather numeric data from subsequent level=1 lines in a block_data
+    block_data = {
+        "N_": {},
+        "V_": {},
+        "C_": {}
+    }
 
-    for j in range(1,4):
-        row_idx = i+j
-        if rows_list[row_idx]["level"]!=1:
-            print(f"Warning: row {row_idx} => not level1 => break block.")
-            valid_block=False
-            break
-        # detect prefix => N_ / V_ / C_
-        cat_up = rows_list[row_idx]["category"].upper()
-        prefix = None
-        # match in level1_map
-        for kw,pfix in level1_map.items():
+    # Move to next row
+    i+=1
+    # while i<nrows and row is level1 => gather
+    while i<nrows and rows_list[i]["level"] == 1:
+        cat_up = rows_list[i]["category"].upper()
+        # find prefix
+        chosen_prefix = None
+        for kw, pref in prefix_map.items():
             if kw in cat_up:
-                prefix = pfix
+                chosen_prefix = pref
                 break
-        if not prefix:
-            print(f"Warning: row {row_idx} text => {cat_up} => no match => skip row.")
+        if not chosen_prefix:
+            print(f"Warning: row {i} has unknown level1 item => {cat_up} => ignoring.")
+            i+=1
             continue
-        # gather numeric data from df
-        row_dict = df.iloc[row_idx].to_dict()
-        for ccc, val in row_dict.items():
-            block_data[prefix][ccc] = val
+        # gather numeric data from df row i => store in block_data[chosen_prefix]
+        row_dict = df.iloc[i].to_dict()
+        for coln, val in row_dict.items():
+            block_data[chosen_prefix][coln] = val
+        # next row
+        i+=1
 
-    # if valid_block => produce one final wide row
-    if valid_block:
-        rec = {}
-        rec["Country"] = country_name
-        # for each col in df => rec["N_<col>"], rec["V_<col>"], rec["C_<col>"]
-        allcols = df.columns
-        for coln in allcols:
-            rec[f"N_{coln}"] = block_data["N_"].get(coln, None)
-            rec[f"V_{coln}"] = block_data["V_"].get(coln, None)
-            rec[f"C_{coln}"] = block_data["C_"].get(coln, None)
-        final_records.append(rec)
+    # Now we've consumed all level1 lines for this country, or we hit next level0 or end
+    # Build final wide record => "Country", plus N_..., V_..., C_...
+    rec = {}
+    rec["Country"] = country_name
+    allcols = df.columns
+    for coln in allcols:
+        rec[f"N_{coln}"] = block_data["N_"].get(coln, None)
+        rec[f"V_{coln}"] = block_data["V_"].get(coln, None)
+        rec[f"C_{coln}"] = block_data["C_"].get(coln, None)
 
-    i += 4  # move to next block
+    final_records.append(rec)
 
-##############################################################################
-# STEP 5: Build final DataFrame
-##############################################################################
+###############################################################################
+# STEP D) Build final DataFrame
+###############################################################################
 df_final = pd.DataFrame(final_records)
-# reorder => Country first
+# reorder => "Country" first
 cols = df_final.columns.tolist()
 cols.remove("Country")
 cols = ["Country"] + cols
 df_final = df_final[cols]
 
-##############################################################################
-# STEP 6: Save
-##############################################################################
+###############################################################################
+# STEP E) Save
+###############################################################################
+
+
+def remove_unnamed_substring(colname: str) -> str:
+    """
+    If 'Unnamed' appears in colname (case-insensitive), cut off everything
+    from 'Unnamed' to the end. Then strip trailing underscores or spaces.
+    """
+    lower_col = colname.lower()
+    idx = lower_col.find("unnamed")
+    if idx != -1:
+        # Chop off from that index onward
+        new_col = colname[:idx].rstrip("_ -")
+        return new_col
+    return colname
+
+# Apply this to your df_final
+new_cols = [remove_unnamed_substring(c) for c in df_final.columns]
+df_final.columns = new_cols
+
+
 df_final.to_excel(output_filename, index=False)
 print("Done. Final shape:", df_final.shape)
